@@ -1,0 +1,675 @@
+#!/bin/bash
+# v01c01-cmake: CMake 命令兼容的交叉编译驱动，底层直接使用 v01c01 工具链。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${SCRIPT_DIR}"
+CACHE_FILENAME="CMakeCache.txt"
+CMAKE_VERSION="3.28.3"
+
+die() { echo "CMake Error: $*" >&2; exit 1; }
+
+ensure_env() {
+    if [[ ! -f "${PROJECT_ROOT}/local/env.sh" ]]; then
+        "${PROJECT_ROOT}/setup_local.sh" >/dev/null
+    fi
+    # shellcheck source=/dev/null
+    source "${PROJECT_ROOT}/local/env.sh"
+}
+
+abs_path() {
+    local path="$1"
+    if [[ -d "${path}" || -f "${path}" ]]; then
+        local dir base
+        dir="$(cd "$(dirname "${path}")" && pwd)"
+        base="$(basename "${path}")"
+        echo "${dir}/${base}"
+    elif [[ -d "${PROJECT_ROOT}/${path}" ]]; then
+        (cd "${PROJECT_ROOT}/${path}" && pwd)
+    elif [[ "${path}" != /* ]]; then
+        echo "$(pwd)/${path}"
+    else
+        echo "${path}"
+    fi
+}
+
+# -------- CMake cache --------
+cache_file() {
+    echo "${1}/${CACHE_FILENAME}"
+}
+
+cache_get() {
+    local file="$1" key="$2" default="${3:-}"
+    local line
+    line="$(grep -E "^${key}:" "${file}" 2>/dev/null | tail -1 || true)"
+    if [[ -z "${line}" ]]; then
+        echo "${default}"
+        return
+    fi
+    echo "${line#*=}"
+}
+
+cache_set() {
+    local file="$1" key="$2" type="$3" value="$4"
+    mkdir -p "$(dirname "${file}")"
+    if [[ -f "${file}" ]] && grep -qE "^${key}:" "${file}"; then
+        sed -i "s|^${key}:.*|${key}:${type}=${value}|" "${file}"
+    else
+        echo "${key}:${type}=${value}" >> "${file}"
+    fi
+}
+
+apply_toolchain_file() {
+    local toolchain="$1"
+    local -n _cache_ref="$2"
+    [[ -f "${toolchain}" ]] || die "Toolchain file not found: ${toolchain}"
+
+    local line
+    while IFS= read -r line; do
+        if [[ "${line}" =~ set\(CMAKE_C_COMPILER[[:space:]]+\"([^\"]+)\"\) ]]; then
+            _cache_ref[CMAKE_C_COMPILER]="${BASH_REMATCH[1]}"
+        elif [[ "${line}" =~ set\(CMAKE_CXX_COMPILER[[:space:]]+\"([^\"]+)\"\) ]]; then
+            _cache_ref[CMAKE_CXX_COMPILER]="${BASH_REMATCH[1]}"
+        elif [[ "${line}" =~ set\(CMAKE_SYSROOT[[:space:]]+\"([^\"]+)\"\) ]]; then
+            _cache_ref[CMAKE_SYSROOT]="${BASH_REMATCH[1]}"
+        elif [[ "${line}" =~ set\(TOOLCHAIN_ROOT[[:space:]]+\"([^\"]+)\" ]]; then
+            _cache_ref[TOOLCHAIN_ROOT]="${BASH_REMATCH[1]}"
+        fi
+    done < "${toolchain}"
+}
+
+build_type_flags() {
+    local build_type="$1"
+    case "${build_type}" in
+        Debug) echo "-O0 -g" ;;
+        Release) echo "-O2 -DNDEBUG" ;;
+        RelWithDebInfo) echo "-O2 -g -DNDEBUG" ;;
+        MinSizeRel) echo "-Os -DNDEBUG" ;;
+        *) echo "-O2" ;;
+    esac
+}
+
+# -------- Parse CMakeLists.txt (subset) --------
+declare -A TARGET_SOURCES
+declare -A TARGET_CFLAGS
+declare -A TARGET_LDFLAGS
+declare -A TARGET_LIBS
+declare -A TARGET_SUBDIR
+
+parse_cmake_lists() {
+    local cmake_dir="$1"
+    local cmake_file="${cmake_dir}/CMakeLists.txt"
+    [[ -f "${cmake_file}" ]] || return 0
+
+    local line target rest subdir src flags lib
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%%#*}"
+
+        if [[ "${line}" =~ add_subdirectory[[:space:]]*\([[:space:]]*([^\)[:space:]]+) ]]; then
+            subdir="${BASH_REMATCH[1]}"
+            parse_cmake_lists "${cmake_dir}/${subdir}"
+            continue
+        fi
+
+        if [[ "${line}" =~ add_executable[[:space:]]*\([[:space:]]*([^[:space:]]+)[[:space:]]+(.+)\) ]]; then
+            target="${BASH_REMATCH[1]}"
+            rest="${BASH_REMATCH[2]}"
+            TARGET_SUBDIR["${target}"]="${cmake_dir}"
+            TARGET_SOURCES["${target}"]="${rest}"
+            continue
+        fi
+
+        if [[ "${line}" =~ target_compile_options[[:space:]]*\([[:space:]]*([^[:space:]]+)[[:space:]]+PRIVATE[[:space:]]+(.+)\) ]]; then
+            target="${BASH_REMATCH[1]}"
+            flags="${BASH_REMATCH[2]}"
+            TARGET_CFLAGS["${target}"]+="${flags} "
+            continue
+        fi
+
+        if [[ "${line}" =~ target_link_options[[:space:]]*\([[:space:]]*([^[:space:]]+)[[:space:]]+PRIVATE[[:space:]]+(.+)\) ]]; then
+            target="${BASH_REMATCH[1]}"
+            flags="${BASH_REMATCH[2]}"
+            TARGET_LDFLAGS["${target}"]+="${flags} "
+            continue
+        fi
+
+        if [[ "${line}" =~ target_link_libraries[[:space:]]*\([[:space:]]*([^[:space:]]+)[[:space:]]+PRIVATE[[:space:]]+(.+)\) ]]; then
+            target="${BASH_REMATCH[1]}"
+            lib="${BASH_REMATCH[2]}"
+            TARGET_LIBS["${target}"]+="${lib} "
+        fi
+    done < "${cmake_file}"
+}
+
+collect_targets() {
+    unset TARGET_SOURCES TARGET_CFLAGS TARGET_LDFLAGS TARGET_LIBS TARGET_SUBDIR
+    declare -gA TARGET_SOURCES TARGET_CFLAGS TARGET_LDFLAGS TARGET_LIBS TARGET_SUBDIR
+    parse_cmake_lists "${1}"
+}
+
+list_all_targets() {
+    printf '%s\n' "${!TARGET_SOURCES[@]}" | sort
+}
+
+generate_ninja() {
+    local build_dir="$1" source_dir="$2" c_compiler="$3" cxx_compiler="$4"
+    local build_type="$5" static="$6"
+
+    collect_targets "${source_dir}"
+
+    local ninja_file="${build_dir}/build.ninja"
+    local -a defaults=()
+    local target rel_dir out_bin out_dir src src_files base ext obj compiler
+    local -a compile_flags link_flags
+    local flags lib static_flag=""
+
+    if [[ "${static}" == "ON" || "${static}" == "TRUE" || "${static}" == "1" ]]; then
+        static_flag="-static"
+    fi
+
+    {
+        echo "ninja_required_version = 1.5"
+        echo ""
+        echo "rule cc"
+        echo "  command = ${c_compiler} \$cflags -c \$in -o \$out"
+        echo "  description = Building C object \$out"
+        echo ""
+        echo "rule cxx"
+        echo "  command = ${cxx_compiler} \$cflags -c \$in -o \$out"
+        echo "  description = Building CXX object \$out"
+        echo ""
+        echo "rule link"
+        echo "  command = ${c_compiler} \$cflags -o \$out \$in \$ldflags"
+        echo "  description = Linking executable \$out"
+        echo ""
+        echo "cflags = $(build_type_flags "${build_type}") --sysroot=$(cache_get "$(cache_file "${build_dir}")" "CMAKE_SYSROOT")"
+        echo "ldflags = ${static_flag}"
+        echo ""
+    } > "${ninja_file}"
+
+    while IFS= read -r target; do
+        [[ -n "${target}" ]] || continue
+
+        rel_dir="${TARGET_SUBDIR[$target]#${source_dir}}"
+        rel_dir="${rel_dir#/}"
+        out_bin="${rel_dir:+${rel_dir}/}${target}"
+        out_dir="${build_dir}/${rel_dir:+${rel_dir}/}CMakeFiles/${target}.dir"
+        mkdir -p "${out_dir}"
+        mkdir -p "${build_dir}/${rel_dir}"
+
+        read -r -a src_files <<< "${TARGET_SOURCES[$target]}"
+        compile_flags=($(build_type_flags "${build_type}") ${TARGET_CFLAGS[$target]:-})
+        link_flags=(${TARGET_LDFLAGS[$target]:-})
+        [[ -n "${static_flag}" ]] && link_flags+=("${static_flag}")
+        for lib in ${TARGET_LIBS[$target]:-}; do
+            if [[ "${lib}" =~ ^-l ]]; then
+                link_flags+=("${lib}")
+            else
+                link_flags+=(-l"${lib}")
+            fi
+        done
+
+        local -a objs=()
+        for src in "${src_files[@]}"; do
+            base="$(basename "${src}")"
+            ext="${base##*.}"
+            obj="${rel_dir:+${rel_dir}/}CMakeFiles/${target}.dir/${base}.o"
+            objs+=("${obj}")
+
+            if [[ "${ext}" == "cpp" || "${ext}" == "cc" || "${ext}" == "cxx" ]]; then
+                compiler="cxx"
+            else
+                compiler="cc"
+            fi
+
+            {
+                echo "build ${obj}: ${compiler} ${TARGET_SUBDIR[$target]}/${src}"
+                echo "  cflags = ${compile_flags[*]} --sysroot=$(cache_get "$(cache_file "${build_dir}")" "CMAKE_SYSROOT")"
+            } >> "${ninja_file}"
+        done
+
+        {
+            echo "build ${out_bin}: link ${objs[*]}"
+            echo "  ldflags = ${link_flags[*]}"
+            echo "build ${target}: phony ${out_bin}"
+            echo ""
+        } >> "${ninja_file}"
+
+        defaults+=("${target}")
+    done < <(list_all_targets)
+
+    if [[ ${#defaults[@]} -eq 0 ]]; then
+        die "No targets found in ${source_dir}"
+    fi
+
+    {
+        echo "build all: phony ${defaults[*]}"
+        echo "default all"
+    } >> "${ninja_file}"
+
+    rm -f "${build_dir}/Makefile"
+}
+
+generate_makefile() {
+    local build_dir="$1"
+    cat > "${build_dir}/Makefile" << EOF
+# Generated by v01c01-cmake. Do not edit.
+
+V01C01_CMAKE := ${SCRIPT_DIR}/v01c01-cmake
+BUILD_DIR := ${build_dir}
+
+.PHONY: all clean install help
+
+all:
+	@"\$(V01C01_CMAKE)" --build "\$(BUILD_DIR)"
+
+clean:
+	@find "\$(BUILD_DIR)" -name '*.o' -delete 2>/dev/null || true
+
+install:
+	@"\$(V01C01_CMAKE)" --install "\$(BUILD_DIR)"
+
+help:
+	@echo "Targets: all clean install"
+	@"\$(V01C01_CMAKE)" --build "\$(BUILD_DIR)" --target help 2>/dev/null || true
+
+%:
+	@"\$(V01C01_CMAKE)" --build "\$(BUILD_DIR)" --target "\$@"
+EOF
+    rm -f "${build_dir}/build.ninja"
+}
+
+generate_build_files() {
+    local build_dir="$1" source_dir="$2" generator="$3"
+    local c_compiler="$4" cxx_compiler="$5" build_type="$6" static="$7"
+
+    if [[ "${generator}" == *Ninja* ]]; then
+        command -v ninja >/dev/null 2>&1 || die "Ninja not found. Install ninja or use -G \"Unix Makefiles\"."
+        generate_ninja "${build_dir}" "${source_dir}" "${c_compiler}" "${cxx_compiler}" "${build_type}" "${static}"
+    else
+        generate_makefile "${build_dir}"
+    fi
+}
+
+# -------- configure --------
+cmd_configure() {
+    local source_dir="" build_dir="" generator="Ninja"
+    local -A defs=()
+    local arg
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -S)
+                shift; source_dir="$(abs_path "$1")" ;;
+            -B)
+                shift; build_dir="$(abs_path "$1")" ;;
+            -G)
+                shift; generator="$1" ;;
+            -D|--define)
+                if [[ "$1" == "-D" ]]; then shift; fi
+                arg="$1"
+                if [[ "${arg}" == *=* ]]; then
+                    defs["${arg%%=*}"]="${arg#*=}"
+                else
+                    defs["${arg}"]="ON"
+                fi
+                ;;
+            -D*)
+                arg="${1#-D}"
+                defs["${arg%%=*}"]="${arg#*=}"
+                ;;
+            --fresh|--install-prefix|--log-level|--preset|--list-presets)
+                shift
+                [[ $# -gt 0 && "${1:0:1}" != "-" ]] && shift
+                continue
+                ;;
+            -Wno-dev|-Wdev|-LA|-N|-E)
+                ;;
+            *)
+                if [[ -z "${source_dir}" && -f "$1/CMakeLists.txt" ]]; then
+                    source_dir="$(abs_path "$1")"
+                elif [[ -z "${build_dir}" ]]; then
+                    build_dir="$(abs_path "$1")"
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    [[ -n "${source_dir}" ]] || die "No source directory specified. Use: cmake <path-to-source> or cmake -S <src> -B <build>"
+    [[ -f "${source_dir}/CMakeLists.txt" ]] || die "The source directory ${source_dir} does not appear to contain CMakeLists.txt."
+    [[ -n "${build_dir}" ]] || build_dir="$(pwd)"
+
+    ensure_env
+
+    local -A cache=(
+        [CMAKE_HOME_DIRECTORY]="${source_dir}"
+        [CMAKE_BUILD_TYPE]="${defs[CMAKE_BUILD_TYPE]:-Release}"
+        [CMAKE_TOOLCHAIN_FILE]="${defs[CMAKE_TOOLCHAIN_FILE]:-${CMAKE_TOOLCHAIN_FILE:-${PROJECT_ROOT}/cmake/aarch64-linux-musleabi.cmake}}"
+        [BUILD_STATIC]="${defs[BUILD_STATIC]:-OFF}"
+        [CMAKE_C_COMPILER]="${CC}"
+        [CMAKE_CXX_COMPILER]="${CXX}"
+        [CMAKE_SYSROOT]="${SYSROOT}"
+        [CMAKE_INSTALL_PREFIX]="${defs[CMAKE_INSTALL_PREFIX]:-/usr/local}"
+        [CMAKE_GENERATOR]="${generator}"
+    )
+
+    if [[ -n "${cache[CMAKE_TOOLCHAIN_FILE]}" && -f "${cache[CMAKE_TOOLCHAIN_FILE]}" ]]; then
+        apply_toolchain_file "${cache[CMAKE_TOOLCHAIN_FILE]}" cache
+    fi
+    cache[CMAKE_C_COMPILER]="${CC}"
+    cache[CMAKE_CXX_COMPILER]="${CXX}"
+    cache[CMAKE_SYSROOT]="${SYSROOT}"
+
+    defs[BUILD_STATIC]="${cache[BUILD_STATIC]}"
+    defs[CMAKE_BUILD_TYPE]="${cache[CMAKE_BUILD_TYPE]}"
+
+    mkdir -p "${build_dir}"
+    local cfile
+    cfile="$(cache_file "${build_dir}")"
+    : > "${cfile}"
+
+    cache_set "${cfile}" "CMAKE_HOME_DIRECTORY" "INTERNAL" "${cache[CMAKE_HOME_DIRECTORY]}"
+    cache_set "${cfile}" "CMAKE_BUILD_TYPE" "STRING" "${cache[CMAKE_BUILD_TYPE]}"
+    cache_set "${cfile}" "CMAKE_TOOLCHAIN_FILE" "FILEPATH" "${cache[CMAKE_TOOLCHAIN_FILE]}"
+    cache_set "${cfile}" "BUILD_STATIC" "BOOL" "${cache[BUILD_STATIC]}"
+    cache_set "${cfile}" "CMAKE_C_COMPILER" "FILEPATH" "${cache[CMAKE_C_COMPILER]}"
+    cache_set "${cfile}" "CMAKE_CXX_COMPILER" "FILEPATH" "${cache[CMAKE_CXX_COMPILER]}"
+    cache_set "${cfile}" "CMAKE_SYSROOT" "PATH" "${cache[CMAKE_SYSROOT]}"
+    cache_set "${cfile}" "CMAKE_INSTALL_PREFIX" "PATH" "${cache[CMAKE_INSTALL_PREFIX]}"
+    cache_set "${cfile}" "CMAKE_GENERATOR" "INTERNAL" "${cache[CMAKE_GENERATOR]}"
+
+    local k v
+    for k in "${!defs[@]}"; do
+        v="${defs[$k]}"
+        if [[ "${k}" =~ ^CMAKE_ || "${k}" == "BUILD_STATIC" ]]; then
+            continue
+        fi
+        cache_set "${cfile}" "${k}" "BOOL" "${v}"
+    done
+
+    generate_build_files "${build_dir}" "${cache[CMAKE_HOME_DIRECTORY]}" "${cache[CMAKE_GENERATOR]}" \
+        "${cache[CMAKE_C_COMPILER]}" "${cache[CMAKE_CXX_COMPILER]}" \
+        "${cache[CMAKE_BUILD_TYPE]}" "${cache[BUILD_STATIC]}"
+
+    echo "-- The C compiler identification is GNU 10.3.0"
+    echo "-- The CXX compiler identification is GNU 10.3.0"
+    echo "-- Detecting C compiler ABI info - done"
+    echo "-- Check for working C compiler: ${cache[CMAKE_C_COMPILER]} - skipped"
+    echo "-- Detecting CXX compiler ABI info - done"
+    echo "-- Check for working CXX compiler: ${cache[CMAKE_CXX_COMPILER]} - skipped"
+    echo "-- Configuring done"
+    echo "-- Generating done"
+    echo "-- Build files have been written to: ${build_dir}"
+}
+
+# -------- build --------
+compile_target() {
+    local build_dir="$1" target="$2" c_compiler="$3" cxx_compiler="$4"
+    local build_type="$5" static="$6"
+
+    local src_dir="${TARGET_SUBDIR[$target]}"
+    local sources="${TARGET_SOURCES[$target]}"
+    local cfile source_home sysroot
+    local out_dir rel_dir
+    local -a src_files=() compile_flags=() link_flags=() objs=()
+    local src base obj compiler ext progress=0 total pct
+
+    cfile="$(cache_file "${build_dir}")"
+    source_home="$(cache_get "${cfile}" "CMAKE_HOME_DIRECTORY")"
+    sysroot="$(cache_get "${cfile}" "CMAKE_SYSROOT")"
+
+    read -r -a src_files <<< "${sources}"
+    total="${#src_files[@]}"
+    rel_dir="${src_dir#${source_home}}"
+    rel_dir="${rel_dir#/}"
+    out_dir="${build_dir}/${rel_dir:+${rel_dir}/}CMakeFiles/${target}.dir"
+    mkdir -p "${out_dir}"
+
+    compile_flags+=($(build_type_flags "${build_type}"))
+    read -r -a compile_flags <<< "${compile_flags[*]} ${TARGET_CFLAGS[$target]:-} --sysroot=${sysroot}"
+
+    link_flags+=(${TARGET_LDFLAGS[$target]:-})
+    if [[ "${static}" == "ON" || "${static}" == "TRUE" || "${static}" == "1" ]]; then
+        link_flags+=(-static)
+    fi
+
+    local lib
+    for lib in ${TARGET_LIBS[$target]:-}; do
+        if [[ "${lib}" =~ ^-l ]]; then
+            link_flags+=("${lib}")
+        else
+            link_flags+=(-l"${lib}")
+        fi
+    done
+
+    for src in "${src_files[@]}"; do
+        ((progress++)) || true
+        pct=$((progress * 100 / (total + 1)))
+        base="$(basename "${src}")"
+        ext="${base##*.}"
+        obj="${out_dir}/${base}.o"
+        objs+=("${obj}")
+
+        if [[ "${ext}" == "cpp" || "${ext}" == "cc" || "${ext}" == "cxx" ]]; then
+            compiler="${cxx_compiler}"
+        else
+            compiler="${c_compiler}"
+        fi
+
+        echo "[${pct}%] Building ${ext^^} object ${rel_dir:+${rel_dir}/}CMakeFiles/${target}.dir/${base}.o"
+        "${compiler}" "${compile_flags[@]}" -c "${src_dir}/${src}" -o "${obj}"
+    done
+
+    pct=100
+    mkdir -p "${build_dir}/${rel_dir}"
+    echo "[${pct}%] Linking ${ext^^} executable ${rel_dir:+${rel_dir}/}${target}"
+    "${c_compiler}" "${compile_flags[@]}" -o "${build_dir}/${rel_dir:+${rel_dir}/}${target}" "${objs[@]}" "${link_flags[@]}"
+    echo "[${pct}%] Built target ${target}"
+}
+
+cmd_build() {
+    local build_dir="" target="" jobs="1" clean_first="OFF"
+    shift || true
+
+    [[ $# -gt 0 ]] || die "Usage: cmake --build <dir>"
+
+    build_dir="$(abs_path "$1")"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target|-t)
+                shift; target="$1" ;;
+            -j|--parallel)
+                if [[ "$1" == "-j" && -n "${2:-}" && "${2}" =~ ^[0-9]+$ ]]; then
+                    shift; jobs="$1"
+                elif [[ "$1" =~ ^-j[0-9]+$ ]]; then
+                    jobs="${1#-j}"
+                else
+                    jobs="$(nproc 2>/dev/null || echo 4)"
+                fi
+                ;;
+            --parallel)
+                shift
+                jobs="${1:-$(nproc 2>/dev/null || echo 4)}"
+                ;;
+            --clean-first)
+                clean_first="ON" ;;
+            --config|-C|--verbose)
+                ;;
+            --)
+                shift; break ;;
+            *)
+                ;;
+        esac
+        shift
+    done
+
+    local cfile
+    cfile="$(cache_file "${build_dir}")"
+    [[ -f "${cfile}" ]] || die "Error: not a CMake build directory (missing ${CACHE_FILENAME})"
+
+    ensure_env
+
+    local source_dir c_compiler cxx_compiler build_type static generator
+    source_dir="$(cache_get "${cfile}" "CMAKE_HOME_DIRECTORY")"
+    c_compiler="$(cache_get "${cfile}" "CMAKE_C_COMPILER" "${CC}")"
+    cxx_compiler="$(cache_get "${cfile}" "CMAKE_CXX_COMPILER" "${CXX}")"
+    build_type="$(cache_get "${cfile}" "CMAKE_BUILD_TYPE" "Release")"
+    static="$(cache_get "${cfile}" "BUILD_STATIC" "OFF")"
+    generator="$(cache_get "${cfile}" "CMAKE_GENERATOR" "Ninja")"
+
+    if [[ "${clean_first}" == "ON" ]]; then
+        find "${build_dir}" -name '*.o' -delete 2>/dev/null || true
+    fi
+
+    if [[ "${generator}" == *Ninja* && -f "${build_dir}/build.ninja" ]]; then
+        command -v ninja >/dev/null 2>&1 || die "Ninja not found"
+        local -a ninja_args=(-C "${build_dir}")
+        if [[ "${jobs}" != "1" ]]; then
+            ninja_args+=(-j "${jobs}")
+        fi
+        if [[ -n "${target}" ]]; then
+            ninja "${ninja_args[@]}" "${target}"
+        else
+            ninja "${ninja_args[@]}"
+        fi
+        return
+    fi
+
+    collect_targets "${source_dir}"
+
+    if [[ -n "${target}" ]]; then
+        [[ -n "${TARGET_SOURCES[$target]:-}" ]] || die "No rule to make target '${target}'"
+        compile_target "${build_dir}" "${target}" "${c_compiler}" "${cxx_compiler}" "${build_type}" "${static}"
+    else
+        local t
+        while IFS= read -r t; do
+            [[ -n "${t}" ]] || continue
+            compile_target "${build_dir}" "${t}" "${c_compiler}" "${cxx_compiler}" "${build_type}" "${static}" &
+        done < <(list_all_targets)
+        wait
+    fi
+}
+
+# -------- install --------
+cmd_install() {
+    local build_dir="" prefix=""
+    shift || true
+    [[ $# -gt 0 ]] || die "Usage: cmake --install <dir>"
+
+    build_dir="$(abs_path "$1")"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --prefix)
+                shift; prefix="$1" ;;
+        esac
+        shift
+    done
+
+    local cfile
+    cfile="$(cache_file "${build_dir}")"
+    [[ -f "${cfile}" ]] || die "Error: not a CMake build directory (missing ${CACHE_FILENAME})"
+
+    local source_dir install_prefix
+    source_dir="$(cache_get "${cfile}" "CMAKE_HOME_DIRECTORY")"
+    install_prefix="${prefix:-$(cache_get "${cfile}" "CMAKE_INSTALL_PREFIX" "/usr/local")}"
+
+    collect_targets "${source_dir}"
+    mkdir -p "${install_prefix}/bin"
+
+    local target rel_dir
+    for target in $(list_all_targets); do
+        rel_dir="${TARGET_SUBDIR[$target]#${source_dir}}"
+        rel_dir="${rel_dir#/}"
+        install -m 755 "${build_dir}/${rel_dir:+${rel_dir}/}${target}" "${install_prefix}/bin/${target}"
+        echo "-- Installing: ${install_prefix}/bin/${target}"
+    done
+}
+
+# -------- cmake -E --------
+cmd_cmake_e() {
+    shift
+    local subcmd="${1:-}"
+    shift || true
+    case "${subcmd}" in
+        echo) printf '%s\n' "$*" ;;
+        make_directory) mkdir -p "$@" ;;
+        rm) [[ "${1:-}" == "-rf" ]] && shift; rm -rf "$@" ;;
+        copy) cp "$@" ;;
+        env) env "$@" ;;
+        true) ;;
+        *) die "cmake -E ${subcmd}: not supported" ;;
+    esac
+}
+
+show_help() {
+    cat << EOF
+Usage
+
+  v01c01-cmake [options] <path-to-source>
+  v01c01-cmake [options] -S <path-to-source> -B <path-to-build>
+  v01c01-cmake --build <dir> [options]
+  v01c01-cmake --install <dir> [options]
+  v01c01-cmake -E <command> [arguments...]
+
+Options
+  -S <path-to-source>     = Explicitly specify a source directory.
+  -B <path-to-build>      = Explicitly specify a build directory.
+  -G <generator>          = Build system generator (default: Ninja).
+  -D <var>[:<type>]=<value>  Create or update cmake cache entry.
+  --build <dir>           = Build a CMake-generated project binary tree.
+  --install <dir>         = Install a CMake-generated project binary tree.
+  --parallel [<jobs>], -j [<jobs>]
+                          = Build in parallel.
+  --target <tgt>          = Build <tgt> instead of default targets.
+  --clean-first           = Clean before building.
+  --version               = Display v01c01-cmake version (CMake compatible).
+  -h, --help              = Print usage information.
+EOF
+}
+
+cmd_version() {
+    cat << EOF
+cmake version ${CMAKE_VERSION}
+
+v01c01-cmake compatibility shim
+Cross toolchain: aarch64-linux-musleabi (GCC 10.3.0 + musl)
+EOF
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        show_help
+        exit 1
+    fi
+
+    case "$1" in
+        --version|-version|-V)
+            cmd_version
+            ;;
+        -h|-help|--help|-usage|--help-policy|-help-property|-help-module|-help-variable)
+            show_help
+            ;;
+        --build)
+            cmd_build "$@"
+            ;;
+        --install)
+            cmd_install "$@"
+            ;;
+        -E)
+            cmd_cmake_e "$@"
+            ;;
+        -P|-script)
+            die "cmake -P/-script is not supported by v01c01-cmake"
+            ;;
+        *)
+            cmd_configure "$@"
+            ;;
+    esac
+}
+
+main "$@"

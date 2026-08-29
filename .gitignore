@@ -1,0 +1,4 @@
+build/
+local/env.sh
+local/env-cross.sh
+local/sysroot/

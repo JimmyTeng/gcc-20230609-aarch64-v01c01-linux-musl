@@ -1,0 +1,29 @@
+# CMake 交叉编译工具链文件 (aarch64-linux-musleabi + musl)
+
+cmake_minimum_required(VERSION 3.10)
+
+get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+set(TOOLCHAIN_ROOT "${PROJECT_ROOT}/aarch64-v01c01-linux-musl-gcc" CACHE PATH "Cross toolchain root")
+set(TOOLCHAIN_PREFIX "aarch64-linux-musleabi" CACHE STRING "Cross toolchain prefix")
+
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+set(CMAKE_C_COMPILER   "${TOOLCHAIN_ROOT}/bin/${TOOLCHAIN_PREFIX}-gcc")
+set(CMAKE_CXX_COMPILER "${TOOLCHAIN_ROOT}/bin/${TOOLCHAIN_PREFIX}-g++")
+set(CMAKE_AR           "${TOOLCHAIN_ROOT}/bin/${TOOLCHAIN_PREFIX}-ar"     CACHE FILEPATH "")
+set(CMAKE_RANLIB       "${TOOLCHAIN_ROOT}/bin/${TOOLCHAIN_PREFIX}-ranlib" CACHE FILEPATH "")
+set(CMAKE_STRIP        "${TOOLCHAIN_ROOT}/bin/${TOOLCHAIN_PREFIX}-strip"  CACHE FILEPATH "")
+
+set(CMAKE_SYSROOT "${TOOLCHAIN_ROOT}/target")
+set(CMAKE_FIND_ROOT_PATH "${CMAKE_SYSROOT}")
+
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+option(BUILD_STATIC "Link executables statically (musl static)" OFF)
+if(BUILD_STATIC)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static" CACHE STRING "" FORCE)
+endif()
